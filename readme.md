@@ -1,5 +1,7 @@
 # BitRoss
 
+Donate ETH: 0xe0D9431D2404CF5cAeb16610626475003A59D427
+
 ## Installation
 
 To use BitRoss, you need to have Python installed. Clone the repository and install the required dependencies.
