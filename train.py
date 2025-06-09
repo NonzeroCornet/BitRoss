@@ -7,12 +7,10 @@ from PIL import Image
 import json
 import os
 import subprocess
-from transformers import BertTokenizer, BertModel
+from transformers import BertTokenizer
 import wandb
-
-# Hyperparameters
-LATENT_DIM = 128
-HIDDEN_DIM = 256
+from generate import generate_image
+from model import CVAE, TextEncoder, LATENT_DIM, HIDDEN_DIM
 
 # Custom dataset
 class Text2ImageDataset(Dataset):
@@ -45,80 +43,14 @@ class Text2ImageDataset(Dataset):
         prompt = str(item['description'])
         return image, prompt
 
-# Text encoder
-class TextEncoder(nn.Module):
-    def __init__(self, hidden_size, output_size):
-        super(TextEncoder, self).__init__()
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
-        self.fc = nn.Linear(self.bert.config.hidden_size, output_size)
-
-    def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        return self.fc(outputs.last_hidden_state[:, 0, :])
-
-# CVAE model
-class CVAE(nn.Module):
-    def __init__(self, text_encoder):
-        super(CVAE, self).__init__()
-        self.text_encoder = text_encoder
-
-        # Encoder
-        self.encoder = nn.Sequential(
-            nn.Conv2d(4, 32, 3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, HIDDEN_DIM)
-        )
-
-        self.fc_mu = nn.Linear(HIDDEN_DIM + HIDDEN_DIM, LATENT_DIM)
-        self.fc_logvar = nn.Linear(HIDDEN_DIM + HIDDEN_DIM, LATENT_DIM)
-
-        # Decoder
-        self.decoder_input = nn.Linear(LATENT_DIM + HIDDEN_DIM, 128 * 4 * 4)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 4, 3, stride=1, padding=1),
-            nn.Tanh()
-        )
-
-    def encode(self, x, c):
-        x = self.encoder(x)
-        x = torch.cat([x, c], dim=1)
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x)
-        return mu, logvar
-
-    def decode(self, z, c):
-        z = torch.cat([z, c], dim=1)
-        x = self.decoder_input(z)
-        x = x.view(-1, 128, 4, 4)
-        return self.decoder(x)
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x, c):
-        mu, logvar = self.encode(x, c)
-        z = self.reparameterize(mu, logvar)
-        return self.decode(z, c), mu, logvar
-
 # Loss function
-def loss_function(recon_x, x, mu, logvar):
-    BCE = nn.functional.mse_loss(recon_x, x, reduction='sum')
+def loss_function(recon_x, x, mu, logvar, beta=1.0):
+    RECON = nn.functional.l1_loss(recon_x, x, reduction='sum')
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return BCE + KLD
+    return RECON + beta * KLD
 
 # Updated training function
-def train(model, train_loader, optimizer, device, tokenizer):
+def train(model, train_loader, optimizer, device, tokenizer, beta=1.0):
     model.train()
     train_loss = 0
     for batch_idx, (data, prompt) in enumerate(train_loader):
@@ -132,7 +64,7 @@ def train(model, train_loader, optimizer, device, tokenizer):
         text_encoding = model.text_encoder(input_ids, attention_mask)
         
         recon_batch, mu, logvar = model(data, text_encoding)
-        loss = loss_function(recon_batch, data, mu, logvar)
+        loss = loss_function(recon_batch, data, mu, logvar, beta=beta)
         loss.backward()
         train_loss += loss.item()
         optimizer.step()
@@ -140,7 +72,7 @@ def train(model, train_loader, optimizer, device, tokenizer):
         # Log batch-level metrics
         wandb.log({
             "batch_loss": loss.item(),
-            "batch_reconstruction_loss": nn.functional.mse_loss(recon_batch, data, reduction='mean').item(),
+            "batch_reconstruction_loss": nn.functional.l1_loss(recon_batch, data, reduction='mean').item(),
             "batch_kl_divergence": (-0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / data.size(0)).item()
         })
     
@@ -153,24 +85,28 @@ def main():
     NUM_EPOCHS = 500
     BATCH_SIZE = 128
     LEARNING_RATE = 1e-4
+    # Beta > 1 encourages disentanglement, Beta < 1 focuses on reconstruction
+    BETA = 0.8
 
     # New hyperparameters
     SAVE_INTERVAL = 25  # Save model every XXX epochs
     SAVE_INTERVAL_IMAGE = 1 # Save generated image every XXX epochs
     PROJECT_NAME = "BitRoss"
     MODEL_NAME = "BitRoss"
-    SAVE_DIR = "/models/BitRoss/"
+    SAVE_DIR = "./models/BitRoss/"
 
     if(os.path.exists(SAVE_DIR) == False):
         os.makedirs(SAVE_DIR)
+
+    num_workers = os.cpu_count() // 2
 
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
     if not os.path.exists(SAVE_DIR):
         os.makedirs(SAVE_DIR)
 
-    DATA_DIR = "./trainingData/"
-    METADATA_FILE = "./trainingData/metadata.json"
+    DATA_DIR = "./training-items/"
+    METADATA_FILE = "./training-items/metadata.json"
     
 
     # Initialize wandb
@@ -181,30 +117,38 @@ def main():
         "BATCH_SIZE": BATCH_SIZE,
         "LEARNING_RATE": LEARNING_RATE,
         "SAVE_INTERVAL": SAVE_INTERVAL,
-        "MODEL_NAME": MODEL_NAME
+        "MODEL_NAME": MODEL_NAME,
+        "BETA": BETA,
+        "num_workers": num_workers
     })
 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     dataset = Text2ImageDataset(DATA_DIR, METADATA_FILE)
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers)
 
     text_encoder = TextEncoder(hidden_size=HIDDEN_DIM, output_size=HIDDEN_DIM)
     model = CVAE(text_encoder).to(device)
+    if torch.__version__.startswith("2."):
+        print("Compiling model with torch.compile()")
+        model = torch.compile(model)
+        
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
     # Log model architecture
     wandb.watch(model, log="all", log_freq=100)
 
     for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss = train(model, train_loader, optimizer, device, tokenizer)
-        print(f'Epoch {epoch}, Loss: {train_loss:.4f}')
+        train_loss = train(model, train_loader, optimizer, device, tokenizer, beta=BETA)
+        print(f'Epoch {epoch}, Loss: {train_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
         
         # Log epoch-level metrics
         wandb.log({
             "epoch": epoch,
             "train_loss": train_loss,
+            "learning_rate": scheduler.get_last_lr()[0]
         })
 
         # Generate image and save model every SAVE_INTERVAL epochs
@@ -213,7 +157,6 @@ def main():
             output_image = f"{SAVE_DIR}output_epoch_{epoch}.png"
             
             # Generate image using the current model state
-            from generate import generate_image
             prompt = "A blue sword made of diamond"  # You can change this prompt as needed
             generated_image = generate_image(model, prompt, device)
             generated_image.save(output_image)
@@ -250,6 +193,8 @@ def main():
                                                        wandb.Image(reconstructed_images[i], caption=f"Reconstructed {i}")]
                     for i in range(4)
                 })
+
+        scheduler.step()
 
     wandb.finish()
 
