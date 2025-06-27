@@ -62,10 +62,10 @@ def describe_image(file_name, project_id, base64_data):
         encoded_image = encode_image_to_base64(resized_image)
 
         prompt = (
-            f"Describe this image in one sentence and a set of keywords. "
+            f"Describe this image in one sentence and a set of keywords. As a hint, the filename is {file_name}. "
             f"Be descriptive and focus on the contents. Do not mention 'minecraft', 'pixel art', 'blocky style', or 'low-resolution style'.\n"
             f"Respond strictly in JSON format:\n"
-            f"```\ninterface Answer {{\n  description: string;\n  keywords: string[];\n}}\n```"
+            f"\ninterface Answer {{\n  description: string;\n  keywords: string[];\n}}\n"
         )
 
         payload = {
@@ -119,14 +119,29 @@ def process_image_group(items):
     return str(thread_id)
 
 
+lastUpdateTime = time.time()
+lastAmount = 0
+
+
 # Periodic display update
 def update_display():
     global processed_files, file_count
     while not stop_display.is_set():
-        os.system("cls" if os.name == "nt" else "clear")
         with write_lock:
-            print(f"Images processed: {processed_files}/{file_count}")
-            print(f"Progress: {processed_files / file_count * 100:.2f}%")
+            processed = processed_files - lastAmount
+            remaining = file_count - processed
+            elapsed = time.time() - lastUpdateTime
+
+            avg_time_per_image = (elapsed / processed) if processed > 0 else 0
+            remaining_seconds = int(remaining * avg_time_per_image)
+
+            days, rem = divmod(remaining_seconds, 86400)
+            hours, rem = divmod(rem, 3600)
+            minutes, seconds = divmod(rem, 60)
+            print(
+                f"Images processed: {processed_files}/{file_count} | Progress: {processed_files / file_count * 100:.2f}% | Estimated time remaining: {days}d {hours:02}h {minutes:02}m {seconds:02}s",
+                end="\r",
+            )
         time.sleep(1)
 
 
@@ -155,7 +170,7 @@ def main():
         items = json.load(f)
 
     file_count = len(items)
-    num_groups = min(50, file_count)
+    num_groups = min(4, file_count)
     group_size = math.ceil(file_count / num_groups)
     item_groups = [items[i : i + group_size] for i in range(0, len(items), group_size)]
 
